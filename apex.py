@@ -193,17 +193,6 @@ def update_priority(lock, global_rb, update_priority_queue):
         global_rb.update_priorities(indexes, td_errors)
         lock.release()
 
-
-def learn(policy, trained_steps, tf_queue, update_priority_queue):
-    while True:
-        trained_steps.value += 1
-        samples = tf_queue.dequeue()
-        td_errors = policy.train(
-            samples["obs"], samples["act"], samples["rew"],
-            samples["next_obs"], samples["done"], samples["weights"])
-
-        update_priority_queue.enqueue({'indexes': samples['indexes'], 'td_errors': td_errors.numpy()+1e-6})
-
 def learner(global_rb, trained_steps, is_training_done,
             lock, n_training, update_freq, evaluation_freq, queues, transitions, n_warmup=3200,
             batch_size=64):
@@ -223,19 +212,16 @@ def learner(global_rb, trained_steps, is_training_done,
 
     start_time = time.time()
     n_transition = 0
-    tf_queue = tf.queue.FIFOQueue(5, dtypes=[np.float16, np.float16, np.float16, np.float16, np.float16, np.float16,
+    tf_queue = tf.queue.FIFOQueue(1, dtypes=[np.float16, np.float16, np.float16, np.float16, np.float16, np.float16,
                                               np.float32],
                                   names=['act', 'done', 'indexes', 'next_obs', 'obs', 'rew', 'weights'])
     t = threading.Thread(target=sample, args=(lock, global_rb, batch_size, tf_queue))
     t.start()
 
-    update_priority_queue = tf.queue.FIFOQueue(5, dtypes=[np.float16, np.float16],
+    update_priority_queue = tf.queue.FIFOQueue(1, dtypes=[np.float16, np.float16],
                                   names=['indexes', 'td_errors'])
     priority_thread = threading.Thread(target=update_priority, args=(lock, global_rb, update_priority_queue))
     priority_thread.start()
-
-    learning_thread = threading.Thread(target=learn, args=(policy, trained_steps, tf_queue, update_priority_queue))
-    learning_thread.start()
 
     while not is_training_done.is_set():
 
@@ -245,17 +231,17 @@ def learner(global_rb, trained_steps, is_training_done,
         # lock.release()
         # queues[-2].put(pickle.dumps(samples))
 
-        # trained_steps.value += 1
-        # samples = tf_queue.dequeue()
-        # td_errors = policy.train(
-        #     samples["obs"], samples["act"], samples["rew"],
-        #     samples["next_obs"], samples["done"], samples["weights"])
-        #
-        # update_priority_queue.enqueue({'indexes': samples['indexes'], 'td_errors': td_errors.numpy()+1e-6})
-        # lock.acquire()
-        # global_rb.update_priorities(
-        #     samples["indexes"], td_errors.numpy() + 1e-6)
-        # lock.release()
+        trained_steps.value += 1
+        samples = tf_queue.dequeue()
+        td_errors = policy.train(
+            samples["obs"], samples["act"], samples["rew"],
+            samples["next_obs"], samples["done"], samples["weights"])
+
+        #update_priority_queue.enqueue({'indexes': samples['indexes'], 'td_errors': td_errors.numpy()+1e-6})
+        lock.acquire()
+        global_rb.update_priorities(
+            samples["indexes"], td_errors.numpy() + 1e-6)
+        lock.release()
 
         # Put updated weights to queue
         if trained_steps.value % update_freq == 0:
@@ -423,8 +409,8 @@ if __name__ == '__main__':
         tasks.append(task)
 
     n_training = 1000000
-    param_update_freq = 100  # 训练100次把参数复制到explorer  # 400是论文数据
-    test_freq = 1000  # 1000次训练后evaluation
+    param_update_freq = 200  # 训练100次把参数复制到explorer  # 400是论文数据
+    test_freq = 3000  # 1000次训练后evaluation
 
     learning = Process(
         target=learner,
