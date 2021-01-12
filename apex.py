@@ -194,12 +194,20 @@ def update_priority(lock, global_rb, update_priority_queue):
         lock.release()
 
 
-def put_weights(queues, policy, weights_queue):
+def put_weights(queues, policy, weights_queue, writer, tf):
     while True:
-        weights_queue.dequeue()
+        training_steps_per_second,  explorers_transitions_per_second, \
+        explorers_frames_per_second, steps = weights_queue.dequeue()
         weights = get_weights_fn(policy)
         for i in range(len(queues) - 1):
             queues[i].put(weights)
+        with writer.as_default():
+            tf.summary.scalar(name="apex/training_steps_per_second", data=training_steps_per_second, step=steps)
+            tf.summary.scalar(name="apex/explorers_transitions_per_second",
+                              data=explorers_transitions_per_second,
+                              step=steps)
+            tf.summary.scalar(name="apex/explorers_frames_per_second", data=explorers_frames_per_second,
+                              step=steps)
 
 
 def learner(global_rb, trained_steps, is_training_done,
@@ -232,9 +240,10 @@ def learner(global_rb, trained_steps, is_training_done,
     # priority_thread = threading.Thread(target=update_priority, args=(lock, global_rb, update_priority_queue))
     # priority_thread.start()
 
-    weights_queue = tf.queue.FIFOQueue(1, dtypes=np.uint8)
-    put_weights_thread = threading.Thread(target=put_weights, args=(queues, policy, weights_queue))
+    weights_queue = tf.queue.FIFOQueue(1, dtypes=[np.float32, np.float32, np.float32, np.int64])
+    put_weights_thread = threading.Thread(target=put_weights, args=(queues, policy, weights_queue, writer, tf))
     put_weights_thread.start()
+
 
     while not is_training_done.is_set():
 
@@ -258,7 +267,7 @@ def learner(global_rb, trained_steps, is_training_done,
 
         # Put updated weights to queue
         if trained_steps.value % update_freq == 0:
-            weights_queue.enqueue([1])
+
             # weights = get_weights_fn(policy)
             # for i in range(len(queues) - 1):
             #     queues[i].put(weights)
@@ -266,13 +275,9 @@ def learner(global_rb, trained_steps, is_training_done,
             explorers_transitions_per_second = (transitions.value - n_transition) / (time.time() - start_time)
             explorers_frames_per_second = explorers_transitions_per_second * frame_skip
             steps = trained_steps.value
+            weights_queue.enqueue([training_steps_per_second,
+                                   explorers_transitions_per_second, explorers_frames_per_second, steps])
 
-            tf.summary.scalar(name="apex/training_steps_per_second", data=training_steps_per_second, step=steps)
-            tf.summary.scalar(name="apex/explorers_transitions_per_second",
-                              data=explorers_transitions_per_second,
-                              step=steps)
-            tf.summary.scalar(name="apex/explorers_frames_per_second", data=explorers_frames_per_second,
-                              step=steps)
 
             start_time = time.time()
             n_transition = transitions.value
@@ -424,7 +429,7 @@ if __name__ == '__main__':
 
     n_training = 1000000
     param_update_freq = 200  # 训练100次把参数复制到explorer  # 400是论文数据
-    test_freq = 3000  # 1000次训练后evaluation
+    test_freq = 1000  # 1000次训练后evaluation
 
     learning = Process(
         target=learner,
