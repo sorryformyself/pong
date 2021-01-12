@@ -22,7 +22,7 @@ action_size = 4
 
 frame_skip = 4  # return one frame in every four frame
 # Initialize deque with zero-images one array for each image
-stacked_frames = deque(maxlen=4)
+
 saveFileName = 'gym_pong'
 saveInternal = 50
 
@@ -75,6 +75,7 @@ def stack_frames(stacked_frames, state, is_new_episode):
     else:
         # Append frame to deque, automatically removes the oldest frame
         stacked_frames.append(frame)
+
     stacked_frames = np.stack(stacked_frames, axis=2)
     return stacked_frames
 
@@ -96,6 +97,7 @@ def explorer(global_rb, queue, trained_steps, is_training_done,
              lock, buffer_size=1024, episode_max_steps=1000, epsilon=0.5, transitions=None):
     tf = import_tf()
     env = _env()
+    stacked_frames = deque(maxlen=4)
     policy = Agent()
     policy.epsilon = epsilon
     env_dict = {"obs": {"shape": state_size},
@@ -183,9 +185,28 @@ def sample(lock, global_rb, batch_size, tf_queue):
         tf_queue.enqueue(samples)
 
 
+def update_priority(lock, global_rb, update_priority_queue):
+    while True:
+        samples = update_priority_queue.dequeue()
+        indexes, td_errors = samples['indexes'], samples['td_errors']
+        lock.acquire()
+        global_rb.update_priorities(indexes, td_errors)
+        lock.release()
+
+
+def learn(policy, trained_steps, tf_queue, update_priority_queue):
+    while True:
+        trained_steps.value += 1
+        samples = tf_queue.dequeue()
+        td_errors = policy.train(
+            samples["obs"], samples["act"], samples["rew"],
+            samples["next_obs"], samples["done"], samples["weights"])
+
+        update_priority_queue.enqueue({'indexes': samples['indexes'], 'td_errors': td_errors.numpy()+1e-6})
+
 def learner(global_rb, trained_steps, is_training_done,
             lock, n_training, update_freq, evaluation_freq, queues, transitions, n_warmup=3200,
-            batch_size=512):
+            batch_size=64):
     tf = import_tf()
     # Wait until explorers collect transitions
     output_dir = prepare_output_dir(
@@ -202,11 +223,19 @@ def learner(global_rb, trained_steps, is_training_done,
 
     start_time = time.time()
     n_transition = 0
-    tf_queue = tf.queue.FIFOQueue(15, dtypes=[np.float16, np.float16, np.float16, np.float16, np.float16, np.float16,
+    tf_queue = tf.queue.FIFOQueue(5, dtypes=[np.float16, np.float16, np.float16, np.float16, np.float16, np.float16,
                                               np.float32],
                                   names=['act', 'done', 'indexes', 'next_obs', 'obs', 'rew', 'weights'])
     t = threading.Thread(target=sample, args=(lock, global_rb, batch_size, tf_queue))
     t.start()
+
+    update_priority_queue = tf.queue.FIFOQueue(5, dtypes=[np.float16, np.float16],
+                                  names=['indexes', 'td_errors'])
+    priority_thread = threading.Thread(target=update_priority, args=(lock, global_rb, update_priority_queue))
+    priority_thread.start()
+
+    learning_thread = threading.Thread(target=learn, args=(policy, trained_steps, tf_queue, update_priority_queue))
+    learning_thread.start()
 
     while not is_training_done.is_set():
 
@@ -216,16 +245,17 @@ def learner(global_rb, trained_steps, is_training_done,
         # lock.release()
         # queues[-2].put(pickle.dumps(samples))
 
-        trained_steps.value += 1
-        samples = tf_queue.dequeue()
-        td_errors = policy.train(
-            samples["obs"], samples["act"], samples["rew"],
-            samples["next_obs"], samples["done"], samples["weights"])
-
-        lock.acquire()
-        global_rb.update_priorities(
-            samples["indexes"], td_errors.numpy() + 1e-6)
-        lock.release()
+        # trained_steps.value += 1
+        # samples = tf_queue.dequeue()
+        # td_errors = policy.train(
+        #     samples["obs"], samples["act"], samples["rew"],
+        #     samples["next_obs"], samples["done"], samples["weights"])
+        #
+        # update_priority_queue.enqueue({'indexes': samples['indexes'], 'td_errors': td_errors.numpy()+1e-6})
+        # lock.acquire()
+        # global_rb.update_priorities(
+        #     samples["indexes"], td_errors.numpy() + 1e-6)
+        # lock.release()
 
         # Put updated weights to queue
         if trained_steps.value % update_freq == 0:
@@ -277,7 +307,7 @@ def evaluator(is_training_done, queue,
         output_dir, filename_suffix="_evaluation")
     writer.set_as_default()
     env = _env()
-
+    stacked_frames = deque(maxlen=4)
     policy = Agent()
     model_save_threshold = save_model_interval
 
