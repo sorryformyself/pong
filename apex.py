@@ -193,6 +193,15 @@ def update_priority(lock, global_rb, update_priority_queue):
         global_rb.update_priorities(indexes, td_errors)
         lock.release()
 
+
+def put_weights(queues, policy, weights_queue):
+    while True:
+        weights_queue.dequeue()
+        weights = get_weights_fn(policy)
+        for i in range(len(queues) - 1):
+            queues[i].put(weights)
+
+
 def learner(global_rb, trained_steps, is_training_done,
             lock, n_training, update_freq, evaluation_freq, queues, transitions, n_warmup=3200,
             batch_size=64):
@@ -218,10 +227,14 @@ def learner(global_rb, trained_steps, is_training_done,
     t = threading.Thread(target=sample, args=(lock, global_rb, batch_size, tf_queue))
     t.start()
 
-    update_priority_queue = tf.queue.FIFOQueue(1, dtypes=[np.float16, np.float16],
-                                  names=['indexes', 'td_errors'])
-    priority_thread = threading.Thread(target=update_priority, args=(lock, global_rb, update_priority_queue))
-    priority_thread.start()
+    # update_priority_queue = tf.queue.FIFOQueue(1, dtypes=[np.float16, np.float16],
+    #                               names=['indexes', 'td_errors'])
+    # priority_thread = threading.Thread(target=update_priority, args=(lock, global_rb, update_priority_queue))
+    # priority_thread.start()
+
+    weights_queue = tf.queue.FIFOQueue(1, dtypes=np.uint8)
+    put_weights_thread = threading.Thread(target=put_weights, args=(queues, policy, weights_queue))
+    put_weights_thread.start()
 
     while not is_training_done.is_set():
 
@@ -245,9 +258,10 @@ def learner(global_rb, trained_steps, is_training_done,
 
         # Put updated weights to queue
         if trained_steps.value % update_freq == 0:
-            weights = get_weights_fn(policy)
-            for i in range(len(queues) - 1):
-                queues[i].put(weights)
+            weights_queue.enqueue([1])
+            # weights = get_weights_fn(policy)
+            # for i in range(len(queues) - 1):
+            #     queues[i].put(weights)
             training_steps_per_second = update_freq / (time.time() - start_time)
             explorers_transitions_per_second = (transitions.value - n_transition) / (time.time() - start_time)
             explorers_frames_per_second = explorers_transitions_per_second * frame_skip
