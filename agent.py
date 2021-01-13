@@ -189,26 +189,25 @@ class Agent:
 if __name__ == '__main__':
     import gym
 
-    videoWriter = Utils.getVideoWriter(saveFileName, fps=30)
     agent = Agent()
-    agent.model = tf.keras.models.load_model('20210101T165431.713437_evaluator_model_rewardshaping',
+    agent.model = tf.keras.models.load_model('20210112T141401.891389_evaluator_model_15minMax',
                                              custom_objects={'tf': tf})
-    agent.target_model = tf.keras.models.load_model('20210101T165431.713437_evaluator_model_rewardshaping',
+    agent.target_model = tf.keras.models.load_model('20210112T141401.891389_evaluator_model_15minMax',
                                                     custom_objects={'tf': tf})
     scores_window = deque(maxlen=30)
     episode_rewards = []
-    env = gym.make('MsPacMan-frame_with_im-v0')
+    env = gym.make('PongDeterministic-v4')
     stacked_frames = deque(maxlen=4)
-
-    from gym_mspacman_frame_with_im_apex import stack_frames
-
-    for episode in range(1, 5):
+    from apex import stack_frames
+    import time
+    for episode in range(1, 6):
         rewards = 0
         state = env.reset()
         state = stack_frames(stacked_frames, state, True)
         while True:
             action = agent.acting(state, test=True)
-            Utils.writeOneFrame(videoWriter, env.render())
+            env.render()
+            time.sleep(0.02)
             next_state, reward, done, _ = env.step(action)
             rewards += reward
             next_state = stack_frames(stacked_frames, next_state, False)
@@ -219,4 +218,3 @@ if __name__ == '__main__':
         Utils.print(episode, scores_window, agent.target_network_counter)
 
     env.close()
-    videoWriter.release()
