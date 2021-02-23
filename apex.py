@@ -4,18 +4,18 @@ import os
 import threading
 import time
 from collections import deque
-from multiprocessing import Process, Event, Value
-from multiprocessing.managers import SyncManager
+from multiprocessing import Process, Event, Value, SimpleQueue
 
 import cv2
 import gym
 import numpy as np
-from agent import Agent, get_weights_fn, set_weights_fn
-from cpprb import PrioritizedReplayBuffer, ReplayBuffer
+from cpprb import MPPrioritizedReplayBuffer, ReplayBuffer
 from gym.envs.mspacman_array_state.Utils import Utils
 
+from agent import Agent, set_weights_fn
+
 step_limit = 50000
-memory_size = 200000
+memory_size = 400000
 
 state_size = (84, 84, 4)
 action_size = 4
@@ -54,8 +54,6 @@ def preprocess_frame(frame):
 
     image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     image = cv2.resize(image, (state_size[0], state_size[1]), interpolation=cv2.INTER_AREA)
-    image = image / 255
-    image = image.astype(np.float16, copy=False)
 
     return image
 
@@ -94,7 +92,7 @@ def frame_skip_step(env, action, video=None):
 
 
 def explorer(global_rb, queue, trained_steps, is_training_done,
-             lock, buffer_size=1024, episode_max_steps=1000, epsilon=0.5, transitions=None):
+             buffer_size=1024, episode_max_steps=1000, epsilon=0.5, transitions=None):
     tf = import_tf()
     env = _env()
     stacked_frames = deque(maxlen=4)
@@ -102,10 +100,10 @@ def explorer(global_rb, queue, trained_steps, is_training_done,
     policy.epsilon = epsilon
     env_dict = {"obs": {"shape": state_size},
                 "act": {},
-                "rew": {},
+                "rew": {"dtype": np.int16},
                 "next_obs": {"shape": state_size},
                 "done": {}}
-    local_rb = ReplayBuffer(buffer_size, env_dict=env_dict, default_dtype=np.float16)
+    local_rb = ReplayBuffer(buffer_size, env_dict=env_dict, default_dtype=np.uint8)
     local_idx = np.arange(buffer_size).astype(np.int)
 
     s = env.reset()
@@ -154,7 +152,7 @@ def explorer(global_rb, queue, trained_steps, is_training_done,
             samples4 = {key: value[150:200] for key, value in samples.items()}
 
             for samples in [samples1, samples2, samples3, samples4]:
-                td_errors = policy.compute_td_error(
+                td_errors = policy.explorer_compute_td_error(
                     samples["obs"], samples["act"], samples["rew"],
                     samples["next_obs"], samples["done"])
                 priorities = td_errors.numpy() + 1e-6
@@ -177,47 +175,20 @@ def explorer(global_rb, queue, trained_steps, is_training_done,
             n_sample_old = n_sample
 
 
-def sample(lock, global_rb, batch_size, tf_queue):
+def sample(global_rb, batch_size, tf_queue):
     while True:
-        lock.acquire()
         samples = global_rb.sample(batch_size)
-        lock.release()
         tf_queue.enqueue(samples)
 
 
-def update_priority(lock, global_rb, update_priority_queue):
-    while True:
-        samples = update_priority_queue.dequeue()
-        indexes, td_errors = samples['indexes'], samples['td_errors']
-        lock.acquire()
-        global_rb.update_priorities(indexes, td_errors)
-        lock.release()
-
-
-def put_weights(queues, policy, weights_queue, writer, tf):
-    while True:
-        training_steps_per_second,  explorers_transitions_per_second, \
-        explorers_frames_per_second, steps = weights_queue.dequeue()
-        weights = get_weights_fn(policy)
-        for i in range(len(queues) - 1):
-            queues[i].put(weights)
-        with writer.as_default():
-            tf.summary.scalar(name="apex/training_steps_per_second", data=training_steps_per_second, step=steps)
-            tf.summary.scalar(name="apex/explorers_transitions_per_second",
-                              data=explorers_transitions_per_second,
-                              step=steps)
-            tf.summary.scalar(name="apex/explorers_frames_per_second", data=explorers_frames_per_second,
-                              step=steps)
-
-
 def learner(global_rb, trained_steps, is_training_done,
-            lock, n_training, update_freq, evaluation_freq, queues, transitions, n_warmup=3200,
+            n_training, update_freq, evaluation_freq, queues, transitions, n_warmup=3200,
             batch_size=64):
     tf = import_tf()
     # Wait until explorers collect transitions
     output_dir = prepare_output_dir(
         args=None, user_specified_dir="./results", suffix="learner")
-    writer = tf.summary.create_file_writer(output_dir)
+    writer = tf.summary.create_file_writer(output_dir, flush_millis=20000, max_queue=1000)
     policy = Agent()
     writer.set_as_default()
     if os.name == 'posix':
@@ -229,29 +200,13 @@ def learner(global_rb, trained_steps, is_training_done,
 
     start_time = time.time()
     n_transition = 0
-    tf_queue = tf.queue.FIFOQueue(1, dtypes=[np.float16, np.float16, np.float16, np.float16, np.float16, np.float16,
-                                              np.float32],
+    tf_queue = tf.queue.FIFOQueue(1, dtypes=[np.uint8, np.uint8, np.float32, np.uint8, np.uint8, np.int16,
+                                             np.float32],
                                   names=['act', 'done', 'indexes', 'next_obs', 'obs', 'rew', 'weights'])
-    t = threading.Thread(target=sample, args=(lock, global_rb, batch_size, tf_queue))
+    t = threading.Thread(target=sample, args=(global_rb, batch_size, tf_queue))
     t.start()
 
-    # update_priority_queue = tf.queue.FIFOQueue(1, dtypes=[np.float16, np.float16],
-    #                               names=['indexes', 'td_errors'])
-    # priority_thread = threading.Thread(target=update_priority, args=(lock, global_rb, update_priority_queue))
-    # priority_thread.start()
-
-    weights_queue = tf.queue.FIFOQueue(1, dtypes=[np.float32, np.float32, np.float32, np.int64])
-    put_weights_thread = threading.Thread(target=put_weights, args=(queues, policy, weights_queue, writer, tf))
-    put_weights_thread.start()
-
-
     while not is_training_done.is_set():
-
-        # tf.summary.experimental.set_step(trained_steps.value)
-        # lock.acquire()
-        # samples = global_rb.sample(batch_size)
-        # lock.release()
-        # queues[-2].put(pickle.dumps(samples))
 
         trained_steps.value += 1
         samples = tf_queue.dequeue()
@@ -259,25 +214,27 @@ def learner(global_rb, trained_steps, is_training_done,
             samples["obs"], samples["act"], samples["rew"],
             samples["next_obs"], samples["done"], samples["weights"])
 
-        #update_priority_queue.enqueue({'indexes': samples['indexes'], 'td_errors': td_errors.numpy()+1e-6})
-        lock.acquire()
+        # update_priority_queue.enqueue({'indexes': samples['indexes'], 'td_errors': td_errors.numpy()+1e-6})
         global_rb.update_priorities(
             samples["indexes"], td_errors.numpy() + 1e-6)
-        lock.release()
 
         # Put updated weights to queue
         if trained_steps.value % update_freq == 0:
 
-            # weights = get_weights_fn(policy)
-            # for i in range(len(queues) - 1):
-            #     queues[i].put(weights)
+            weights = policy.model.get_weights()
+            for i in range(len(queues) - 1):
+                queues[i].put(weights)
             training_steps_per_second = update_freq / (time.time() - start_time)
             explorers_transitions_per_second = (transitions.value - n_transition) / (time.time() - start_time)
             explorers_frames_per_second = explorers_transitions_per_second * frame_skip
             steps = trained_steps.value
-            weights_queue.enqueue([training_steps_per_second,
-                                   explorers_transitions_per_second, explorers_frames_per_second, steps])
 
+            tf.summary.scalar(name="apex/training_steps_per_second", data=training_steps_per_second, step=steps)
+            tf.summary.scalar(name="apex/explorers_transitions_per_second",
+                              data=explorers_transitions_per_second,
+                              step=steps)
+            tf.summary.scalar(name="apex/explorers_frames_per_second", data=explorers_frames_per_second,
+                              step=steps)
 
             start_time = time.time()
             n_transition = transitions.value
@@ -285,7 +242,7 @@ def learner(global_rb, trained_steps, is_training_done,
         # Periodically do evaluation
         if trained_steps.value % evaluation_freq == 0:
             # writer.flush()
-            queues[-1].put(get_weights_fn(policy))
+            queues[-1].put(policy.model.get_weights())
             queues[-1].put(trained_steps.value)
 
         if trained_steps.value >= n_training:
@@ -309,7 +266,7 @@ def evaluator(is_training_done, queue,
     output_dir = prepare_output_dir(
         args=None, user_specified_dir="./results", suffix="evaluator")
     writer = tf.summary.create_file_writer(
-        output_dir, filename_suffix="_evaluation")
+        output_dir, filename_suffix="_evaluation", flush_millis=20000, max_queue=1000)
     writer.set_as_default()
     env = _env()
     stacked_frames = deque(maxlen=4)
@@ -381,20 +338,15 @@ def prepare_output_dir(args, user_specified_dir=None, argv=None,
 
 
 if __name__ == '__main__':
-    SyncManager.register('PrioritizedReplayBuffer',
-                         PrioritizedReplayBuffer)
-    manager = SyncManager()
-    manager.start()
 
     PER_a = 0.6  # P(i) = p(i) ** a / total_priority ** a
 
     env_dict = {"obs": {"shape": state_size},
                 "act": {},
-                "rew": {},
+                "rew": {"dtype": np.int16},
                 "next_obs": {"shape": state_size},
                 "done": {}}
-    global_rb = manager.PrioritizedReplayBuffer(memory_size, env_dict=env_dict, alpha=PER_a, default_dtype=np.float16,
-                                                check_for_update=True)
+    global_rb = MPPrioritizedReplayBuffer(memory_size, env_dict=env_dict, alpha=PER_a, default_dtype=np.uint8)
 
     n_explorer = multiprocessing.cpu_count() - 1
     epsilons = [pow(0.4, 1 + (i / (n_explorer - 1)) * 7) for i in range(n_explorer)]  # apex paper
@@ -402,15 +354,12 @@ if __name__ == '__main__':
     n_queue = n_explorer
     n_queue += 1  # for evaluation
     # n_queue += 1  # for prefetch
-    queues = [manager.Queue() for _ in range(n_queue)]
+    queues = [SimpleQueue() for _ in range(n_queue)]
 
     # Event object to share training status. if event is set True, all exolorers stop sampling transitions
     is_training_done = Event()
 
     transitions = Value('i', 0)
-
-    # Lock
-    lock = manager.Lock()
 
     # Shared memory objects to count number of samples and applied gradients
     trained_steps = Value('i', 0)
@@ -423,7 +372,7 @@ if __name__ == '__main__':
         task = Process(
             target=explorer,
             args=[global_rb, queues[i], trained_steps, is_training_done,
-                  lock, local_buffer_size, episode_max_steps, epsilons[i], transitions])
+                  local_buffer_size, episode_max_steps, epsilons[i], transitions])
         task.start()
         tasks.append(task)
 
@@ -434,7 +383,7 @@ if __name__ == '__main__':
     learning = Process(
         target=learner,
         args=[global_rb, trained_steps, is_training_done,
-              lock, n_training, param_update_freq,
+              n_training, param_update_freq,
               test_freq, queues, transitions])
     learning.start()
     tasks.append(learning)
@@ -447,12 +396,6 @@ if __name__ == '__main__':
         args=[is_training_done, queues[-1], save_model_interval, n_evaluation, episode_max_steps, False])
     evaluating.start()
     tasks.append(evaluating)
-
-    # prefetch = Process(
-    #     target=prefetch,
-    #     args=[is_training_done, queues[-2], global_rb, lock, trained_steps])
-    # prefetch.start()
-    # tasks.append(prefetch)
 
     for task in tasks:
         task.join()
