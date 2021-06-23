@@ -12,7 +12,7 @@ import numpy as np
 from cpprb import MPPrioritizedReplayBuffer, ReplayBuffer
 from gym.envs.mspacman_array_state.Utils import Utils
 
-from agent import Agent, set_weights_fn
+from agent import Agent, set_weights_fn, get_weights_fn
 
 step_limit = 50000
 memory_size = 400000
@@ -21,7 +21,6 @@ state_size = (84, 84, 4)
 action_size = 4
 
 frame_skip = 4  # return one frame in every four frame
-# Initialize deque with zero-images one array for each image
 
 saveFileName = 'gym_pong'
 saveInternal = 50
@@ -32,9 +31,6 @@ def import_tf():
     if tf.config.experimental.list_physical_devices('GPU'):
         for cur_device in tf.config.experimental.list_physical_devices("GPU"):
             tf.config.experimental.set_memory_growth(cur_device, enable=True)
-    # from tensorflow.keras.mixed_precision import experimental as mixed_precision
-    # policy = mixed_precision.Policy('mixed_float16')
-    # mixed_precision.set_policy(policy)
     return tf
 
 
@@ -78,20 +74,7 @@ def stack_frames(stacked_frames, state, is_new_episode):
     return stacked_frames
 
 
-# not used now. Edited in gym
-def frame_skip_step(env, action, video=None):
-    total_reward = 0.0
-    for i in range(frame_skip):
-        if video:
-            Utils.writeOneFrame(video, env.render())
-        obs, reward, done, info = env.step(action)
-        total_reward += reward
-        if done:
-            break
-    return obs, total_reward, done, info
-
-
-def explorer(global_rb, queue, trained_steps, is_training_done,
+def explorer(global_rb, queue, is_training_done,
              buffer_size=1024, episode_max_steps=1000, epsilon=0.5, transitions=None):
     tf = import_tf()
     env = _env()
@@ -112,7 +95,6 @@ def explorer(global_rb, queue, trained_steps, is_training_done,
     total_reward = 0.
     total_rewards = []
 
-    start = time.time()
     n_sample, n_sample_old = 0, 0
 
     while not is_training_done.is_set():
@@ -152,7 +134,7 @@ def explorer(global_rb, queue, trained_steps, is_training_done,
             samples4 = {key: value[150:200] for key, value in samples.items()}
 
             for samples in [samples1, samples2, samples3, samples4]:
-                td_errors = policy.explorer_compute_td_error(
+                td_errors = policy.compute_td_error(
                     samples["obs"], samples["act"], samples["rew"],
                     samples["next_obs"], samples["done"])
                 priorities = td_errors.numpy() + 1e-6
@@ -166,13 +148,6 @@ def explorer(global_rb, queue, trained_steps, is_training_done,
                 next_obs=samples["next_obs"], done=samples["done"],
                 priorities=samples['priority'])
             local_rb.clear()
-
-            ave_rew = (0 if len(total_rewards) == 0 else
-                       sum(total_rewards) / len(total_rewards))
-
-            total_rewards = []
-            start = time.time()
-            n_sample_old = n_sample
 
 
 def sample(global_rb, batch_size, tf_queue):
@@ -220,8 +195,7 @@ def learner(global_rb, trained_steps, is_training_done,
 
         # Put updated weights to queue
         if trained_steps.value % update_freq == 0:
-
-            weights = policy.model.get_weights()
+            weights = get_weights_fn(policy)
             for i in range(len(queues) - 1):
                 queues[i].put(weights)
             training_steps_per_second = update_freq / (time.time() - start_time)
@@ -241,8 +215,7 @@ def learner(global_rb, trained_steps, is_training_done,
 
         # Periodically do evaluation
         if trained_steps.value % evaluation_freq == 0:
-            # writer.flush()
-            queues[-1].put(policy.model.get_weights())
+            queues[-1].put(get_weights_fn(policy))
             queues[-1].put(trained_steps.value)
 
         if trained_steps.value >= n_training:
@@ -292,7 +265,6 @@ def evaluator(is_training_done, queue,
                 done = False
                 for _ in range(episode_max_steps):
                     action = policy.acting(obs, test=True)
-                    # next_obs, reward, done, _ = frame_skip_step(env, action)
                     next_obs, reward, done, _ = env.step(action)
                     if show_test_progress:
                         env.render()
@@ -308,12 +280,11 @@ def evaluator(is_training_done, queue,
             avg_test_return /= n_evaluated_episode
             tf.summary.scalar(
                 name="apex/average_test_return", data=avg_test_return)
-            # writer.flush()
+
             if trained_steps > model_save_threshold:
                 model_save_threshold += save_model_interval
                 policy.model.save(output_dir + '_model')
-                # checkpoint_manager.save()
-    # checkpoint_manager.save()
+
     policy.model.save(output_dir + '_model')
 
 
@@ -353,7 +324,6 @@ if __name__ == '__main__':
 
     n_queue = n_explorer
     n_queue += 1  # for evaluation
-    # n_queue += 1  # for prefetch
     queues = [SimpleQueue() for _ in range(n_queue)]
 
     # Event object to share training status. if event is set True, all exolorers stop sampling transitions
@@ -371,13 +341,13 @@ if __name__ == '__main__':
     for i in range(n_explorer):
         task = Process(
             target=explorer,
-            args=[global_rb, queues[i], trained_steps, is_training_done,
+            args=[global_rb, queues[i], is_training_done,
                   local_buffer_size, episode_max_steps, epsilons[i], transitions])
         task.start()
         tasks.append(task)
 
     n_training = 1000000
-    param_update_freq = 200  # 训练100次把参数复制到explorer  # 400是论文数据
+    param_update_freq = 200  # 训练200次把参数复制到explorer
     test_freq = 1000  # 1000次训练后evaluation
 
     learning = Process(

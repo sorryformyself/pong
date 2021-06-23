@@ -8,8 +8,15 @@ state_size = (84, 84, 4)
 action_size = 4
 
 
+def get_weights_fn(policy):
+    return (policy.model.get_weights(),
+            policy.target_model.get_weights())
+
+
 def set_weights_fn(policy, weights):
-    policy.model.set_weights(weights)
+    model_weights, target_model_weights = weights
+    policy.model.set_weights(model_weights)
+    policy.target_model.set_weights(target_model_weights)
 
 
 saveFileName = 'gym_pong'
@@ -17,7 +24,6 @@ saveFileName = 'gym_pong'
 
 class Agent:
     def __init__(self):
-        # other hyper parameters
 
         self.isTraining = True
         self.keepTraining = False
@@ -109,12 +115,8 @@ class Agent:
     def compute_td_error(self, buffer_state, buffer_action, buffer_reward, buffer_next_state, buffer_done):
         return self._compute_td_error_body(buffer_state, buffer_action, buffer_reward, buffer_next_state, buffer_done)
 
-    def explorer_compute_td_error(self, buffer_state, buffer_action, buffer_reward, buffer_next_state, buffer_done):
-        return self._explorer_compute_td_error_body(buffer_state, buffer_action, buffer_reward, buffer_next_state, buffer_done)
-
     @tf.function
     def _train_body(self, states, actions, rewards, next_states, dones, weights):
-        # weights = tf.cast(weights, dtype=tf.float16)
         with tf.GradientTape() as tape:
             td_errors = self._compute_td_error_body(states, actions, rewards, next_states, dones)
             # loss = tf.reduce_mean(self.huber_loss(td_errors, delta=10.) * weights)
@@ -143,32 +145,6 @@ class Agent:
         indexes = tf.concat(values=(batch_size_range,
                                     tf.expand_dims(max_next_q_indexes, axis=1)), axis=1)  # (batch_size, 2)
         target_q = tf.gather_nd(self.target_model(next_states), indexes)  # (batch_size, )
-        target_q = tf.where(dones, rewards, rewards + self.n_gamma * target_q)  # (batch_size, )
-
-        # don't want change the weights of target network in backpropagation, so tf.stop_gradient()
-        # but seems no use
-        td_errors = tf.abs(current_q - tf.stop_gradient(target_q))
-        return td_errors
-
-    @tf.function
-    def _explorer_compute_td_error_body(self, states, actions, rewards, next_states, dones):
-        batch_size = states.shape[0]
-        states = states / 255
-        next_states = next_states / 255
-        rewards = tf.cast(tf.squeeze(rewards), dtype=tf.float32)
-        dones = tf.cast(tf.squeeze(dones), dtype=tf.bool)
-        actions = tf.cast(actions, dtype=tf.int32)  # (batch_size, 1)
-        batch_size_range = tf.expand_dims(tf.range(batch_size), axis=1)  # (batch_size, 1)
-
-        # get current q value
-        current_q_indexes = tf.concat(values=(batch_size_range, actions), axis=1)  # (batch_size, 2)
-        current_q = tf.gather_nd(self.model(states), current_q_indexes)  # (batch_size, )
-
-        # get target q value using double dqn
-        max_next_q_indexes = tf.argmax(self.model(next_states), axis=1, output_type=tf.int32)  # (batch_size, )
-        indexes = tf.concat(values=(batch_size_range,
-                                    tf.expand_dims(max_next_q_indexes, axis=1)), axis=1)  # (batch_size, 2)
-        target_q = tf.gather_nd(self.model(next_states), indexes)  # (batch_size, )
         target_q = tf.where(dones, rewards, rewards + self.n_gamma * target_q)  # (batch_size, )
 
         # don't want change the weights of target network in backpropagation, so tf.stop_gradient()
@@ -225,6 +201,7 @@ if __name__ == '__main__':
     stacked_frames = deque(maxlen=4)
     from apex import stack_frames
     import time
+
     for episode in range(1, 6):
         rewards = 0
         state = env.reset()
