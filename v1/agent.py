@@ -2,7 +2,7 @@ from collections import deque
 
 import numpy as np
 import tensorflow as tf
-from gym.envs.mspacman_array_state.Utils import Utils
+from gym.envs.mspacman.Utils import Utils
 
 state_size = (84, 84, 4)
 action_size = 4

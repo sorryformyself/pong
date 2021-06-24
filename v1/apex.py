@@ -12,7 +12,7 @@ import gym
 import numpy as np
 from agent import Agent, get_weights_fn, set_weights_fn
 from cpprb import PrioritizedReplayBuffer, ReplayBuffer
-from gym.envs.mspacman_array_state.Utils import Utils
+from gym.envs.mspacman.Utils import Utils
 
 step_limit = 50000
 memory_size = 200000

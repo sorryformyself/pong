@@ -10,7 +10,7 @@ import cv2
 import gym
 import numpy as np
 from cpprb import MPPrioritizedReplayBuffer, ReplayBuffer
-from gym.envs.mspacman_array_state.Utils import Utils
+from gym.envs.mspacman.Utils import Utils
 
 from agent import Agent, set_weights_fn, get_weights_fn
 
